@@ -26,7 +26,7 @@ Este contexto impone restricciones concretas que definen toda la estrategia meto
 
 Dado que los datos ya tienen calidad de rango aplicada, las anomalías que el pipeline debe detectar son las que ese proceso no captura:
 
-![Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico (SAMA)](fig1.png)
+![Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico (SAMA)](figs/fig1.png)
 *Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico. Se distinguen fallas instrumentales (A), anomalías contextuales e hidrológicas (B) y su impacto operacional (C).*
 
 | Tipo | Descripción | ¿Detectable con rangos? | Prioridad |
