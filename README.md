@@ -3,13 +3,12 @@
 
 **Versión**: 1.0  
 **Fecha**: Junio 2026  
-**Audiencia**: Ingenieros e investigadores DAGRAN / Universidad de Antioquia
 
 ---
 
 ## 1. Contexto y Motivación
 
-El Sistema de Alerta y Monitoreo de Antioquia (SAMA), operado por el DAGRAN en convenio con la Universidad de Antioquia, instrumentaliza cuencas de alto riesgo en Antioquia con sensores de nivel, pluviómetros, estaciones meteorológicas y cámaras. Con más de 111 instrumentos en 36 municipios priorizados, el volumen de datos generados supera la capacidad de revisión manual oportuna.
+El Sistema de Alerta y Monitoreo de Antioquia (SAMA), operado por el DAGRAN en convenio con la Universidad de Antioquia, instrumentaliza cuencas de alto riesgo en Antioquia con sensores de nivel, pluviómetros, estaciones meteorológicas y cámaras. 
 
 El problema central no es de expertise sino de escala: **la proporción entre volumen de datos y capacidad de revisión humana crece con cada nuevo sensor instalado**. Esto introduce dos riesgos operativos:
 
@@ -32,6 +31,9 @@ Antes de seleccionar métodos es necesario precisar qué constituye una anomalí
 | **Drift** | Desviación gradual creciente o decreciente | Nivel | Degradación del sensor, sedimentación |
 | **Oscilación artificial** | Ruido periódico no presente en señal física | Lluvia | Interferencia en transmisión |
 | **Anomalía contextual** | Valor plausible individualmente pero inconsistente con el contexto multivariado | Nivel | Nivel sube sin lluvia previa en cuenca |
+
+![Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico (SAMA)](figs/fig1.png)
+*Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico. Se distinguen fallas instrumentales (A), anomalías contextuales e hidrológicas (B) y su impacto operacional (C).*
 
 La distinción entre **error de sensor** y **evento hidrológico real** es el desafío central: un spike de nivel puede ser un fallo electrónico o el inicio de una avenida torrencial. El contexto multivariado (lluvia acumulada en la cuenca) es la única forma de discriminarlos automáticamente.
 
@@ -200,6 +202,9 @@ Features cruzadas (nivel × lluvia):
 ---
 
 ## 4. Arquitectura del Pipeline en Capas
+
+![Figura 2. Pipeline escalonado de detección de anomalías para SAMA](figs/fig2.png)
+*Figura 2. Pipeline escalonado de detección de anomalías para SAMA. Cada capa actúa como filtro progresivo: las capas tempranas detectan errores evidentes de sensor; las capas avanzadas capturan patrones sutiles y contextuales.*
 
 El pipeline implementa un principio de **fail-fast escalonado**: cada capa filtra lo que la anterior no puede, con latencia y costo computacional crecientes. Si una capa detecta una anomalía, se emite la alerta sin invocar las capas siguientes.
 
