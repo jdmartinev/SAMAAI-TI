@@ -26,7 +26,7 @@ Este contexto impone restricciones concretas que definen toda la estrategia meto
 
 Dado que los datos ya tienen calidad de rango aplicada, las anomalías que el pipeline debe detectar son las que ese proceso no captura:
 
-![Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico (SAMA)](figs/fig1.png)
+![Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico (SAMA)](fig1.png)
 *Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico. Se distinguen fallas instrumentales (A), anomalías contextuales e hidrológicas (B) y su impacto operacional (C).*
 
 | Tipo | Descripción | ¿Detectable con rangos? | Prioridad |
@@ -607,19 +607,20 @@ Dato entrante (serie univariada por sensor)
               │
               ▼
 ┌─────────────────────────────────────────┐
-│  CAPA 1 — Cuantiles históricos          │  Siempre activa (E1+)
-│  + detector de valor constante          │  Score: s1
+│  CAPA 1 — Hampel filter                 │  Siempre activa (E1+)
+│  + Cuantiles condicionales por hora     │  Score: s1
+│  + Detector de valor constante          │
 └─────────────┬───────────────────────────┘
               │
               ▼
 ┌─────────────────────────────────────────┐
 │  CAPA 2 — STL+IQR (nivel)              │  Activa desde E2 (≥ 60 días)
-│           ETS o SARIMA (ambas)          │  Score: s2
+│           ETS o SARIMA (ambas variables)│  Score: s2
 └─────────────┬───────────────────────────┘
               │
               ▼
 ┌─────────────────────────────────────────┐
-│  CAPA 3 — Isolation Forest              │  Activa desde E2.5 (≥ 5 meses)
+│  CAPA 3 — Isolation Forest              │  Activa desde E2.5 (≥ 150 días)
 │           (features de ventana)         │  Score: s3
 └─────────────┬───────────────────────────┘
               │
@@ -638,8 +639,8 @@ El **score agregado ponderado** permite graduar la alerta (warning vs. crítica)
 
 Los pesos se calibran empíricamente durante la validación operacional. Un punto de partida razonable para cada etapa:
 
-| Etapa | s1 (cuantiles) | s2 (STL/ETS) | s3 (IF) | s4 (LSTM/Prophet) |
-|-------|---------------|--------------|---------|-------------------|
+| Etapa | s1 (Hampel + cuantiles cond.) | s2 (STL/ETS) | s3 (IF) | s4 (LSTM/Prophet) |
+|-------|------------------------------|--------------|---------|-------------------|
 | E1 | 1.0 | — | — | — |
 | E2 | 0.2 | 0.8 | — | — |
 | E2.5 | 0.15 | 0.50 | 0.35 | — |
@@ -670,7 +671,7 @@ La ausencia de etiquetas impide calcular métricas supervisadas (precision, reca
 **Métricas operacionales proxy**:
 - *Tasa de alertas por sensor por semana*: un modelo bien calibrado debería generar entre 0.5% y 3% de alertas sobre el total de datos. Tasas superiores indican umbral demasiado sensible; inferiores, modelo insuficientemente sensible.
 - *Distribución temporal de alertas*: las alertas deberían correlacionar con períodos de lluvia intensa o eventos conocidos, no distribuirse aleatoriamente.
-- *Concordancia entre modelos*: si Cuantiles y SARIMA coinciden en flaggear un punto, la probabilidad de que sea anomalía real es mayor que si solo uno de ellos lo detecta.
+- *Concordancia entre modelos*: si Hampel y ETS/SARIMA coinciden en flaggear un punto, la probabilidad de que sea anomalía real es mayor que si solo uno de ellos lo detecta. En E2.5+, la concordancia con Isolation Forest es señal adicional de confianza.
 
 **Protocolo de feedback humano** (desde el primer día):
 
@@ -707,10 +708,12 @@ Este loop es el mecanismo principal de mejora continua y la única forma de cons
 | Prophet | Lluvia | Mensual | Últimos 365 días | 730 días (2 años) |
 
 **Razonamiento de las ventanas**:
-- Los cuantiles se benefician de toda la historia disponible (más datos = mejor estimación de percentiles extremos).
-- STL necesita historia suficiente para estimar la estacionalidad diaria, pero no más de 60 días — historia muy larga introduce no-estacionariedad.
-- SARIMA con 90 días captura bien la dinámica estacional diaria sin perder sensibilidad a cambios recientes.
-- Prophet necesita múltiples ciclos anuales; no se activa hasta tener 2 años.
+- **Hampel**: no requiere entrenamiento — opera sobre ventana deslizante en tiempo real. Solo los cuantiles condicionales se recalculan mensualmente.
+- **STL+IQR**: 60 días captura suficientes ciclos diarios para estimar la estacionalidad sin introducir no-estacionariedad de largo plazo.
+- **ETS/SARIMA**: 90 días equilibra sensibilidad a cambios recientes con estabilidad estadística. El criterio de elección entre ambos (Ljung-Box sobre residuos ETS) se ejecuta en E0 y se reverifica en cada reentrenamiento mensual.
+- **Isolation Forest**: 90 días de features calculadas requiere al menos 150 días de historia cruda (los primeros 60 se usan para calcular las features de la primera ventana).
+- **LSTM Autoencoder**: entrenamiento costoso, modelo estable — reentrenamiento trimestral con 365 días es suficiente.
+- **Prophet**: armónicos de Fourier anuales requieren múltiples ciclos completos; no activar hasta 730 días.
 
 ### 7.2 Triggers de reentrenamiento reactivo
 
@@ -753,42 +756,199 @@ def detectar_cambio_estructural(serie: pd.Series,
 
 ```python
 from prefect import flow, task
+from prefect.schedules import CronSchedule
 import mlflow
+from enum import Enum
+from dataclasses import dataclass
+
+class Etapa(Enum):
+    E1 = "e1"       # Hampel + cuantiles condicionales
+    E2 = "e2"       # + STL/ETS/SARIMA
+    E2_5 = "e2_5"   # + Isolation Forest
+    E3 = "e3"       # + LSTM + Prophet
+
+UMBRALES_ACTIVACION = {
+    # modelo: días mínimos de historia limpia requeridos
+    "cuantiles_condicionales": 30,
+    "stl_iqr": 60,
+    "ets_sarima": 90,
+    "isolation_forest": 150,
+    "lstm_autoencoder": 540,
+    "prophet": 730,
+}
 
 @task
-def verificar_datos_suficientes(sensor_id: str, modelo: str,
-                                  min_dias: int) -> bool:
-    n_dias = contar_dias_historia_limpia(sensor_id)
-    return n_dias >= min_dias
+def determinar_etapa(sensor_id: str) -> Etapa:
+    """
+    Cada sensor puede estar en una etapa diferente según su historia disponible.
+    Con 111 sensores instalados en distintos momentos, esto es la norma.
+    """
+    dias = contar_dias_historia_limpia(sensor_id)
+    if dias >= UMBRALES_ACTIVACION["lstm_autoencoder"]:
+        return Etapa.E3
+    elif dias >= UMBRALES_ACTIVACION["isolation_forest"]:
+        return Etapa.E2_5
+    elif dias >= UMBRALES_ACTIVACION["ets_sarima"]:
+        return Etapa.E2
+    else:
+        return Etapa.E1
 
 @task
 def reentrenar_modelo(sensor_id: str, modelo_tipo: str,
                       ventana_dias: int) -> dict:
+    """
+    Entrena un modelo para un sensor específico.
+    Excluye automáticamente puntos confirmados como anómalos por operadores.
+    """
     datos = cargar_datos_limpios(sensor_id, dias=ventana_dias)
-    # excluir puntos confirmados como anómalos por operadores
     datos = excluir_anotados_anomalos(datos, sensor_id)
+
+    if len(datos) < UMBRALES_ACTIVACION[modelo_tipo]:
+        return None  # insuficientes datos limpios post-exclusión
+
     nuevo_modelo = entrenar(modelo_tipo, datos)
     metricas = calcular_metricas_operacionales(nuevo_modelo, datos)
-    return {"modelo": nuevo_modelo, "metricas": metricas}
+    return {"modelo": nuevo_modelo, "metricas": metricas, "n_datos": len(datos)}
 
 @task
-def promover_modelo(sensor_id: str, nuevo_modelo: dict,
-                    modelo_tipo: str) -> None:
-    with mlflow.start_run():
-        mlflow.log_params(nuevo_modelo["modelo"].get_params())
-        mlflow.log_metrics(nuevo_modelo["metricas"])
-        mlflow.sklearn.log_model(nuevo_modelo["modelo"],
-                                  f"{sensor_id}_{modelo_tipo}")
+def promover_si_mejora(sensor_id: str, nuevo: dict, modelo_tipo: str) -> bool:
+    """
+    Solo promueve a producción si el nuevo modelo no degrada las métricas.
+    Umbral: el nuevo modelo debe igualar o superar el 98% del modelo vigente.
+    Si no hay modelo vigente, promueve directamente.
+    """
+    if nuevo is None:
+        return False
 
-@flow(name="reentrenamiento-semanal-sama")
-def pipeline_reentrenamiento_semanal():
-    sensores = obtener_lista_sensores_activos()
-    for sensor_id in sensores:
-        # STL+IQR — semanal para sensores de nivel
-        if es_sensor_nivel(sensor_id):
-            if verificar_datos_suficientes(sensor_id, "stl_iqr", 60):
-                modelo = reentrenar_modelo(sensor_id, "stl_iqr", 60)
-                promover_modelo(sensor_id, modelo, "stl_iqr")
+    modelo_vigente = mlflow_cargar_modelo_produccion(sensor_id, modelo_tipo)
+
+    with mlflow.start_run(tags={"sensor": sensor_id, "modelo": modelo_tipo}):
+        mlflow.log_params(nuevo["modelo"].get_params())
+        mlflow.log_metrics(nuevo["metricas"])
+        mlflow.log_metric("n_datos_entrenamiento", nuevo["n_datos"])
+
+        if modelo_vigente is None:
+            mlflow.set_tag("stage", "Production")
+            return True
+
+        tasa_nueva = nuevo["metricas"]["tasa_alertas"]
+        tasa_vigente = modelo_vigente.metricas["tasa_alertas"]
+
+        # Verificar que la tasa de alertas no se dispare
+        if tasa_nueva <= tasa_vigente * 1.5:
+            mlflow.set_tag("stage", "Production")
+            return True
+        else:
+            mlflow.set_tag("stage", "Staging")
+            notificar_equipo(f"Modelo {modelo_tipo} sensor {sensor_id} "
+                             f"en Staging — tasa alertas subió {tasa_nueva:.1%}")
+            return False
+
+# ─── DAG SEMANAL: STL+IQR ───────────────────────────────────────────────────
+@flow(name="reentrenamiento-semanal-stl",
+      description="Reentrenamiento semanal STL+IQR para sensores de nivel en E2+")
+def dag_semanal_stl():
+    sensores_nivel = [s for s in obtener_sensores_activos()
+                      if es_sensor_nivel(s)]
+    for sensor_id in sensores_nivel:
+        etapa = determinar_etapa(sensor_id)
+        if etapa.value >= Etapa.E2.value:
+            nuevo = reentrenar_modelo(sensor_id, "stl_iqr", ventana_dias=60)
+            promover_si_mejora(sensor_id, nuevo, "stl_iqr")
+
+# ─── DAG MENSUAL: cuantiles + ETS/SARIMA + IF ────────────────────────────────
+@flow(name="reentrenamiento-mensual",
+      description="Reentrenamiento mensual de cuantiles, ETS/SARIMA e IF")
+def dag_mensual():
+    for sensor_id in obtener_sensores_activos():
+        etapa = determinar_etapa(sensor_id)
+        variable = "nivel" if es_sensor_nivel(sensor_id) else "lluvia"
+
+        # Cuantiles condicionales — E1+
+        nuevo = reentrenar_modelo(sensor_id, "cuantiles_condicionales",
+                                  ventana_dias=None)  # toda la historia
+        promover_si_mejora(sensor_id, nuevo, "cuantiles_condicionales")
+
+        # ETS o SARIMA — E2+
+        if etapa.value >= Etapa.E2.value:
+            tipo_modelo = determinar_ets_o_sarima(sensor_id)  # criterio Ljung-Box
+            nuevo = reentrenar_modelo(sensor_id, tipo_modelo, ventana_dias=90)
+            promover_si_mejora(sensor_id, nuevo, tipo_modelo)
+
+        # Isolation Forest — E2.5+
+        if etapa.value >= Etapa.E2_5.value:
+            nuevo = reentrenar_modelo(sensor_id, "isolation_forest",
+                                      ventana_dias=90)
+            promover_si_mejora(sensor_id, nuevo, "isolation_forest")
+
+# ─── DAG TRIMESTRAL: LSTM ────────────────────────────────────────────────────
+@flow(name="reentrenamiento-trimestral-lstm",
+      description="Reentrenamiento trimestral LSTM Autoencoder — solo E3")
+def dag_trimestral_lstm():
+    for sensor_id in obtener_sensores_activos():
+        etapa = determinar_etapa(sensor_id)
+        if etapa == Etapa.E3:
+            nuevo = reentrenar_modelo(sensor_id, "lstm_autoencoder",
+                                      ventana_dias=365)
+            promover_si_mejora(sensor_id, nuevo, "lstm_autoencoder")
+
+# ─── DAG MENSUAL PROPHET: solo lluvia E3 ─────────────────────────────────────
+@flow(name="reentrenamiento-mensual-prophet",
+      description="Reentrenamiento mensual Prophet — pluviómetros E3")
+def dag_mensual_prophet():
+    pluviometros = [s for s in obtener_sensores_activos()
+                    if not es_sensor_nivel(s)]
+    for sensor_id in pluviometros:
+        etapa = determinar_etapa(sensor_id)
+        if etapa == Etapa.E3:
+            nuevo = reentrenar_modelo(sensor_id, "prophet", ventana_dias=365)
+            promover_si_mejora(sensor_id, nuevo, "prophet")
+
+# ─── TRIGGER REACTIVO: cambio estructural o reemplazo de sensor ──────────────
+@flow(name="reentrenamiento-reactivo",
+      description="Dispara reentrenamiento completo cuando se detecta cambio estructural")
+def dag_reactivo(sensor_id: str, motivo: str):
+    """
+    Invocado por:
+    - Sistema de gestión de activos al registrar reemplazo/recalibración
+    - Monitor de drift cuando PSI > 0.2 o tasa alertas > 3× baseline
+    """
+    etapa = determinar_etapa(sensor_id)
+    modelos_activos = obtener_modelos_activos_para_etapa(etapa)
+
+    for modelo_tipo, ventana in modelos_activos.items():
+        nuevo = reentrenar_modelo(sensor_id, modelo_tipo, ventana_dias=ventana)
+        promover_si_mejora(sensor_id, nuevo, modelo_tipo)
+
+    registrar_evento_reentrenamiento(sensor_id, motivo)
+```
+
+### 7.5 Gestión de 111 sensores en etapas simultáneas
+
+Con sensores instalados en distintos momentos, el estado del sistema en producción es heterogéneo: algunos sensores pueden estar en E1 mientras otros ya alcanzaron E2.5. La función `determinar_etapa()` del DAG evalúa esto dinámicamente en cada ejecución — no hay configuración manual por sensor.
+
+El registro de etapa por sensor se mantiene en MLflow como metadata:
+
+```python
+# Convención de nombres en MLflow Model Registry:
+# "{sensor_id}__{modelo_tipo}"
+# Ejemplos:
+#   "SM001__stl_iqr"
+#   "SM001__isolation_forest"
+#   "SM042__cuantiles_condicionales"
+
+# En inferencia, cargar todos los modelos activos para un sensor:
+def cargar_modelos_sensor(sensor_id: str) -> dict:
+    etapa = determinar_etapa(sensor_id)
+    modelos = {}
+    for modelo_tipo in obtener_modelos_para_etapa(etapa):
+        try:
+            modelos[modelo_tipo] = mlflow.pyfunc.load_model(
+                f"models:/{sensor_id}__{modelo_tipo}/Production"
+            )
+        except mlflow.exceptions.MlflowException:
+            pass  # modelo aún no entrenado para este sensor
+    return modelos
 ```
 
 ---
@@ -816,13 +976,13 @@ Antes de entrenar cualquier modelo, se requiere:
 
 ## 9. Consideraciones Específicas para Cuencas Andinas
 
-**Ciclo convectivo vespertino**: en muchas cuencas de Antioquia, la lluvia ocurre preferentemente en las tardes (convección orográfica). Esto genera un ciclo diario fuerte en los pluviómetros que STL y SARIMA capturan, pero que puede confundirse con anomalías si los modelos se inicializan con poca historia.
+**Ciclo convectivo vespertino**: en muchas cuencas de Antioquia, la lluvia ocurre preferentemente en las tardes (convección orográfica). Esto genera un ciclo diario fuerte en los pluviómetros que ETS/SARIMA capturan bien una vez activos. En E1, el Hampel puede flaggear el inicio de un evento convectivo intenso como spike si la ventana es corta — se recomienda ventana de ±4 puntos mínimo (1 hora a 15-min) para que la mediana local tenga inercia suficiente ante eventos reales.
 
 **Respuesta hiperrápida**: cuencas de montaña con pendientes pronunciadas tienen tiempos de concentración de minutos a pocas horas. A 15-min de resolución, un evento real puede verse como un spike puntual si el tiempo de concentración es menor que el intervalo de muestreo. Estos casos son difíciles de distinguir de fallas de sensor sin contexto adicional.
 
 **Gaps correlacionados con eventos extremos**: los sensores tienden a fallar durante eventos de alta lluvia (inundación del equipo, pérdida de comunicación satelital). Imputar estos gaps con valores promedio es incorrecto y contamina el histórico de entrenamiento. Los gaps > 2 horas durante períodos de lluvia detectada en estaciones vecinas deben marcarse como "gap durante evento potencial" y excluirse del entrenamiento.
 
-**Distribución no-gaussiana de lluvia**: las series de lluvia tienen distribución fuertemente asimétrica con exceso de ceros. Para SARIMA, se recomienda transformación log(x + 0.1) antes del ajuste. Para cuantiles, el percentil 0% es cero la mayor parte del tiempo — usar los percentiles condicionados a lluvia > 0 para el umbral superior, y tratar la ocurrencia (lluvia vs. no-lluvia) como variable binaria separada.
+**Distribución no-gaussiana de lluvia**: las series de lluvia tienen distribución fuertemente asimétrica con exceso de ceros. Para ETS/SARIMA, se recomienda transformación `log(x + 0.1)` antes del ajuste. Para los cuantiles condicionales, calcularlos condicionados a lluvia > 0 para el umbral superior, y tratar la ocurrencia (lluvia vs. no-lluvia) como variable binaria separada detectada por el detector de valor constante.
 
 ---
 
