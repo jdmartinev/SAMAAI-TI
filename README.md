@@ -1,444 +1,472 @@
 # Detección de Anomalías en Series de Tiempo Hidrológicas
 ## Plan de Acción para el Sistema SAMA — Antioquia, Colombia
 
-**Versión**: 1.0  
+**Versión**: 2.0  
 **Fecha**: Junio 2026  
 
 ---
 
-## 1. Contexto y Motivación
+## 1. Contexto y Restricciones del Problema
 
-El Sistema de Alerta y Monitoreo de Antioquia (SAMA), operado por el DAGRAN en convenio con la Universidad de Antioquia, instrumentaliza cuencas de alto riesgo en Antioquia con sensores de nivel, pluviómetros, estaciones meteorológicas y cámaras. 
+El Sistema de Alerta y Monitoreo de Antioquia (SAMA) instrumentaliza cuencas de alto riesgo con sensores de nivel y pluviómetros, entre otros, con frecuencias de muestreo de 5 a 15 minutos. El punto de partida para este plan es una base de datos histórica de menos de un año, con datos que han pasado por un proceso de calidad básico (verificación de rangos físicos).
 
-El problema central no es de expertise sino de escala: **la proporción entre volumen de datos y capacidad de revisión humana crece con cada nuevo sensor instalado**. Esto introduce dos riesgos operativos:
+Este contexto impone restricciones concretas que definen toda la estrategia metodológica:
 
-- **Falsos negativos**: anomalías reales (eventos de avenida torrencial) no detectadas a tiempo por saturación del analista.
-- **Falsos positivos**: alertas espurias por datos de sensor defectuoso que erosionan la confianza del sistema comunitario.
+**Sin etiquetas de anomalías**: no existe un conjunto de datos anotado que indique cuáles observaciones son anómalas. Esto descarta directamente los métodos supervisados y exige un enfoque completamente no supervisado, donde la validación de los modelos depende de inspección visual y criterio experto hidrológico.
 
-Este informe propone un pipeline automatizado de detección de anomalías en tres capas metodológicas, combinando métodos estadísticos clásicos con machine learning, y describe la infraestructura de MLOps necesaria para su operación sostenible.
+**Historia corta (< 1 año)**: muchos métodos que explotan estacionalidad anual son inestables o no aplicables. En particular, Prophet — que modela ciclos anuales mediante series de Fourier — requiere al menos dos ciclos anuales completos para estimar correctamente la componente estacional bimodal de las cuencas andinas. Prophet se propone como meta de mediano plazo, no como herramienta de arranque.
+
+**Frecuencias de muestreo heterogéneas entre sensores**: distintos instrumentos reportan a 5, 10 o 15 minutos. Esto impide construir matrices multivariadas alineadas temporalmente de forma confiable en esta etapa, por lo que todos los modelos de detección deben ser **estrictamente univariados** — un modelo por serie, por estación.
+
+**Datos con calidad básica aplicada**: el histórico disponible ya pasó por verificación de rangos físicos. Esto significa que los errores más groseros (valores negativos, fuera de rango absoluto) ya fueron removidos o marcados. El pipeline propuesto opera sobre este dataset de entrada y se enfoca en anomalías más sutiles.
 
 ---
 
-## 2. Taxonomía de Anomalías en Datos SAMA
+## 2. Taxonomía de Anomalías Objetivo
 
-Antes de seleccionar métodos es necesario precisar qué constituye una anomalía en este contexto. La literatura hidrológica identifica las siguientes categorías, ordenadas por prioridad operativa:
-
-| Tipo | Descripción | Variable afectada | Causa típica |
-|------|-------------|-------------------|--------------|
-| **Spike puntual** | Valor aislado fuera de rango, retorno inmediato | Nivel, lluvia | Golpe mecánico, interferencia eléctrica |
-| **Valor constante** | Secuencia de valores idénticos > N periodos | Nivel, lluvia | Sensor atascado, falla de comunicación |
-| **Level shift** | Salto abrupto sostenido sin retorno | Nivel | Obstrucción, recalibración incorrecta |
-| **Drift** | Desviación gradual creciente o decreciente | Nivel | Degradación del sensor, sedimentación |
-| **Oscilación artificial** | Ruido periódico no presente en señal física | Lluvia | Interferencia en transmisión |
-| **Anomalía contextual** | Valor plausible individualmente pero inconsistente con el contexto multivariado | Nivel | Nivel sube sin lluvia previa en cuenca |
+Dado que los datos ya tienen calidad de rango aplicada, las anomalías que el pipeline debe detectar son las que ese proceso no captura:
 
 ![Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico (SAMA)](figs/fig1.png)
 *Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico. Se distinguen fallas instrumentales (A), anomalías contextuales e hidrológicas (B) y su impacto operacional (C).*
 
-La distinción entre **error de sensor** y **evento hidrológico real** es el desafío central: un spike de nivel puede ser un fallo electrónico o el inicio de una avenida torrencial. El contexto multivariado (lluvia acumulada en la cuenca) es la única forma de discriminarlos automáticamente.
+| Tipo | Descripción | ¿Detectable con rangos? | Prioridad |
+|------|-------------|------------------------|-----------|
+| Spike puntual | Valor aislado fuera de lo esperado, retorno inmediato | Parcialmente | Alta |
+| Valor constante | Secuencia de valores idénticos por N períodos | No | Alta |
+| Level shift | Salto abrupto sostenido sin retorno | No | Alta |
+| Drift | Desviación gradual creciente o decreciente | No | Media |
+| Oscilación artificial | Ruido periódico no presente en la señal física | No | Media |
 
-Un hallazgo relevante de la literatura es que la concordancia entre evaluadores humanos al etiquetar anomalías en series de caudal es sorprendentemente baja — en torno al 12% de solapamiento entre pares de analistas (Rebolho et al., 2021). Esto tiene dos implicaciones directas: (1) priorizar métodos no supervisados sobre supervisados, dado que las etiquetas históricas son escasas y ruidosas; (2) diseñar el sistema para que explique su decisión, no solo que emita una bandera binaria.
+La distinción entre **falla de sensor** y **evento hidrológico real** es el problema central. Un aumento brusco de nivel puede ser un spike de sensor o el inicio de una avenida torrencial. Sin datos multivariados alineados, esta distinción en esta etapa debe quedar a criterio del operador; el sistema provee el flag y el contexto, no la decisión final.
+
+Un hallazgo relevante de la literatura es que la concordancia entre evaluadores humanos al etiquetar anomalías en series de caudal es sorprendentemente baja — en torno al 12% de solapamiento entre pares de analistas (Rebolho et al., 2021). Esto refuerza el diseño no supervisado y la necesidad de que el sistema explique su decisión, no solo emita una bandera binaria.
 
 ---
 
-## 3. Métodos Seleccionados
+## 3. Estrategia Metodológica: Complejidad Incremental
 
-Se seleccionaron tres métodos complementarios que cubren el espacio de detección desde reglas interpretables hasta modelos multivariados.
+La propuesta central es una **progresión de complejidad creciente**, comenzando con los métodos más simples e interpretables y avanzando a medida que se acumula historia, se adquiere confianza en los modelos y eventualmente se construye un conjunto de datos etiquetado.
 
-La Capa 1 aplica detectores distintos según la variable, motivado por sus propiedades estadísticas:
+Esta progresión tiene una lógica operativa: los métodos simples son fáciles de explicar a operadores e hidrológos, fallan de formas predecibles y establecen un baseline contra el cual evaluar métodos más complejos.
 
-| Variable | Método Capa 1 | Justificación |
-|----------|---------------|---------------|
-| **Nivel** | STL + IQR | Ciclo diario regular y suave, estacionariedad relativa, varianza estable |
-| **Lluvia** | Prophet + intervalo de credibilidad | Distribución asimétrica, estacionalidad bimodal anual, muchos ceros |
+```
+ETAPA 1 — Arranque          ETAPA 2 — Consolidación     ETAPA 3 — Madurez
+(0–6 meses de historia)     (6–18 meses)                (> 18 meses)
 
-### 3.1a STL + IQR — para sensores de nivel
+Cuantiles históricos    →   STL + IQR               →   Prophet + IC
+                        →   SARIMA residuals         →   (+ datos etiquetados
+                                                          acumulados)
+```
 
-**Fundamento**: Seasonal-Trend decomposition using Loess (STL) descompone la serie en tendencia, componente estacional y residual. El IQR (Interquartile Range) se aplica sobre el residual para identificar puntos cuyo comportamiento no es explicado ni por la tendencia ni por el patrón cíclico esperado.
+Cada etapa hereda los modelos de la anterior y los mantiene activos como baseline. No se reemplazan — se suman capas.
+
+---
+
+## 4. Descripción de Métodos por Etapa
+
+### Etapa 1 — Cuantiles Históricos
+
+**Cuándo aplicar**: desde el primer día, con cualquier cantidad de historia disponible.
+
+**Fundamento**: el método más simple posible. Se calculan los percentiles empíricos de la distribución histórica de cada serie. Un valor nuevo se marca como anómalo si cae fuera del rango `[Q_α/2, Q_{1-α/2}]` donde `α` es el nivel de significancia (típicamente 0.01 o 0.02).
+
+```python
+import numpy as np
+
+def detector_cuantiles(historia: np.ndarray, nuevo_valor: float,
+                       alpha: float = 0.01) -> dict:
+    q_low = np.quantile(historia, alpha / 2)
+    q_high = np.quantile(historia, 1 - alpha / 2)
+    es_anomalia = (nuevo_valor < q_low) or (nuevo_valor > q_high)
+    score = max(
+        (q_low - nuevo_valor) / (q_high - q_low + 1e-9),
+        (nuevo_valor - q_high) / (q_high - q_low + 1e-9),
+        0.0
+    )
+    return {"anomalia": es_anomalia, "score": score,
+            "q_low": q_low, "q_high": q_high}
+```
+
+**Variante por contexto temporal**: en lugar de usar toda la historia, calcular cuantiles por **hora del día** y por **mes** (cuando haya suficiente historia). Esto convierte el detector global en uno contextual sin necesidad de descomposición:
+
+```python
+# Cuantiles condicionados a hora del día
+def cuantiles_por_hora(df: pd.DataFrame, alpha: float = 0.01) -> pd.DataFrame:
+    return df.groupby(df.index.hour)['valor'].quantile(
+        [alpha / 2, 1 - alpha / 2]
+    ).unstack()
+```
+
+**Detección de valor constante** (complemento obligatorio desde Etapa 1):
+
+```python
+def detector_constante(serie: pd.Series, n_min: int = 6) -> bool:
+    """Retorna True si los últimos n_min valores son idénticos."""
+    return serie.iloc[-n_min:].nunique() == 1
+```
+
+**Limitaciones**:
+- No captura la estructura temporal — un valor puede ser normal en temporada de lluvias y anómalo en verano, y el detector global no lo distingue
+- Sensible a la calidad del histórico inicial: si hay anomalías no detectadas en el histórico, los cuantiles se corrompen
+- No detecta drift ni level shifts (valores dentro del rango global pero inconsistentes con el comportamiento reciente)
+
+**Reentrenamiento**: recalcular cuantiles mensualmente con ventana deslizante de toda la historia disponible. Operación trivial, sin hiperparámetros que optimizar.
+
+---
+
+### Etapa 2a — STL + IQR (para sensores de nivel)
+
+**Cuándo aplicar**: con al menos 60–90 días de historia limpia a resolución sub-horaria.
+
+**Fundamento**: STL descompone la serie en tendencia, componente estacional y residual. El IQR se aplica sobre el residual. La diferencia clave respecto a los cuantiles es que STL *sustrae el patrón esperado* antes de evaluar: un valor alto en época de lluvias no genera residual alto si el modelo ya sabe que esa época tiene valores altos.
 
 ```
 Y(t) = Tendencia(t) + Estacionalidad(t) + Residual(t)
-
-Anomalía si: Residual(t) < Q1 - k·IQR  o  Residual(t) > Q3 + k·IQR
+Anomalía si: |Residual(t)| > Q3 + k · IQR  o  < Q1 - k · IQR
 ```
 
-STL es apropiado para nivel porque esta variable tiene un ciclo diario relativamente estable (influenciado por temperatura, evapotranspiración y dinámica fluvial) cuya amplitud no varía drásticamente entre temporadas. El IQR sobre el residual es robusto ante la distribución no-gaussiana leve de los residuos de nivel.
+Para datos a 15 minutos con ciclo diario, `period = 96` (96 muestras × 15 min = 24 horas).
 
-**Ventajas en contexto SAMA**:
-- Ciclo diario de nivel capturado con `period=24` (datos horarios) o `period=96` (datos 15-min)
-- `robust=True` reduce el peso de los propios outliers al estimar los componentes
-- Completamente interpretable: se puede mostrar a un operador cuál es el residual y cuál es el umbral
-- Liviano computacionalmente — adecuado para reentrenamiento semanal en producción
+```python
+from statsmodels.tsa.seasonal import STL
 
-**Limitaciones**:
-- Univariado — no cruza información entre sensores
-- Con un único `period`, no captura la modulación anual de la amplitud del ciclo diario — aceptable para nivel, problemático para lluvia
-- Batch por naturaleza; en producción se aplica sobre ventana deslizante con reentrenamiento semanal
+def entrenar_stl(serie: pd.Series, period: int = 96) -> dict:
+    stl = STL(serie, period=period, robust=True)
+    resultado = stl.fit()
+    residual = resultado.resid
+    Q1, Q3 = np.percentile(residual, [25, 75])
+    IQR = Q3 - Q1
+    return {"modelo": resultado, "Q1": Q1, "Q3": Q3, "IQR": IQR,
+            "tendencia": resultado.trend, "estacional": resultado.seasonal}
 
-**Parámetros clave**:
+def detectar_stl_iqr(residual_nuevo: float, params: dict,
+                     k: float = 3.0) -> dict:
+    lim_inf = params["Q1"] - k * params["IQR"]
+    lim_sup = params["Q3"] + k * params["IQR"]
+    es_anomalia = (residual_nuevo < lim_inf) or (residual_nuevo > lim_sup)
+    score = max(
+        (lim_inf - residual_nuevo) / (params["IQR"] + 1e-9),
+        (residual_nuevo - lim_sup) / (params["IQR"] + 1e-9),
+        0.0
+    )
+    return {"anomalia": es_anomalia, "score": score,
+            "lim_inf": lim_inf, "lim_sup": lim_sup}
+```
 
-| Parámetro | Descripción | Rango sugerido |
-|-----------|-------------|---------------|
-| `period` | Longitud del ciclo estacional en muestras | 24 (horario), 96 (15-min) |
-| `k` | Multiplicador del IQR para el umbral | 2.5–3.5 según sensibilidad requerida |
-| `robust` | Usa regresión M-estimator en Loess | Siempre `True` en datos de campo |
+**Por qué STL para nivel y no para lluvia**: el nivel de río tiene un ciclo diario relativamente estable (influenciado por temperatura, evapotranspiración y dinámica fluvial base) cuya estructura STL captura bien con `period=96`. La lluvia, en cambio, es intermitente (muchos ceros), asimétrica y su ciclo anual bimodal no puede representarse con un único `period` — para lluvia, STL no es apropiado.
+
+**Reentrenamiento**: semanal, con ventana deslizante de los últimos 60 días.
 
 ---
 
-### 3.1b Prophet + Intervalo de Credibilidad — para pluviómetros
+### Etapa 2b — SARIMA Residuals (nivel y lluvia)
 
-**Fundamento**: Prophet (Taylor & Letham, 2018) modela la serie como suma de componentes con estructura bayesiana:
+**Cuándo aplicar**: con al menos 90 días de historia, en paralelo con STL.
 
+**Fundamento**: SARIMA modela la serie como función de sus valores pasados y errores pasados, capturando la **dependencia temporal de corto plazo**. La anomalía se define por el residuo del modelo: un valor es anómalo si es inconsistente con los últimos N valores observados, independientemente del patrón estacional.
+
+Esto es complementario a STL: STL detecta anomalías respecto al patrón esperado; SARIMA detecta anomalías respecto a la dinámica reciente. Un nivel que sube abruptamente puede ser normal estacionalmente pero anómalo dinámicamente.
+
+```python
+from pmdarima import auto_arima
+
+def seleccionar_orden_sarima(serie_train: pd.Series,
+                              m: int = 96) -> dict:
+    """
+    Selección automática de orden. Se ejecuta una vez por estación
+    durante el setup, no en cada inferencia.
+    m: período estacional (96 para 15-min con ciclo diario)
+    """
+    modelo = auto_arima(
+        serie_train,
+        seasonal=True, m=m,
+        stepwise=True,          # búsqueda eficiente
+        suppress_warnings=True,
+        error_action='ignore',
+        max_p=3, max_q=3,
+        max_P=2, max_Q=2
+    )
+    return modelo
+
+def detectar_sarima(modelo, serie_nueva: pd.Series,
+                    k_sigma: float = 3.0) -> dict:
+    pred = modelo.predict_in_sample(return_conf_int=True, alpha=0.01)
+    residuos = serie_nueva.values - pred[0]
+    sigma = np.std(residuos[~np.isnan(residuos)])
+    anomalias = np.abs(residuos) > k_sigma * sigma
+    return anomalias, np.abs(residuos) / (sigma + 1e-9)
 ```
-Y(t) = g(t) + s(t) + h(t) + ε(t)
-```
 
-donde `g(t)` es la tendencia (lineal o logística), `s(t)` la suma de componentes estacionales (Fourier) y `h(t)` efectos de eventos especiales. Prophet genera nativamente un **intervalo de predicción** `[ŷ_lower, ŷ_upper]`; un valor real fuera de ese intervalo se marca como anómalo.
+**Nota sobre lluvia**: la distribución fuertemente asimétrica de lluvia (muchos ceros, cola derecha larga) requiere transformación antes de SARIMA. Se recomienda transformación Box-Cox o simplemente log(x + 1).
+
+**Reentrenamiento**: mensual, con ventana deslizante de 90 días.
+
+---
+
+### Etapa 3 — Prophet + Intervalo de Credibilidad (lluvia, mediano plazo)
+
+**Cuándo aplicar**: cuando se disponga de al menos 2 ciclos anuales completos (~18–24 meses de historia). No aplicar antes — con historia corta, los armónicos de Fourier que representan la estacionalidad anual no convergen bien y el modelo genera intervalos incorrectos.
+
+**Fundamento**: Prophet modela la serie como suma de componentes con estructura bayesiana, incluyendo múltiples estacionalidades simultáneas. Para lluvia en cuencas andinas, la estacionalidad anual bimodal (dos temporadas de lluvias: marzo–mayo y septiembre–noviembre) es precisamente el tipo de estructura que Prophet está diseñado para capturar.
 
 ```python
 from prophet import Prophet
 
-modelo = Prophet(
-    interval_width=0.99,          # intervalo de credibilidad al 99%
-    yearly_seasonality=True,      # captura bimodalidad anual
-    daily_seasonality=True,       # captura ciclo convectivo diario
-    seasonality_mode='multiplicative'  # varianza escala con la media — correcto para lluvia
-)
-modelo.fit(df_train)  # df con columnas 'ds' y 'y'
+def entrenar_prophet_lluvia(df_train: pd.DataFrame) -> Prophet:
+    """df_train con columnas 'ds' (datetime) y 'y' (lluvia)."""
+    modelo = Prophet(
+        interval_width=0.99,
+        yearly_seasonality=True,       # captura bimodalidad anual
+        daily_seasonality=True,        # captura ciclo convectivo vespertino
+        seasonality_mode='multiplicative',  # varianza escala con la media
+        changepoint_prior_scale=0.05   # tendencia poco flexible (lluvia es estacionaria)
+    )
+    modelo.fit(df_train)
+    return modelo
 
-forecast = modelo.predict(df_future)
-anomalias = (df_real['y'] < forecast['yhat_lower']) | \
-            (df_real['y'] > forecast['yhat_upper'])
+def detectar_prophet(modelo: Prophet, df_nuevo: pd.DataFrame) -> pd.DataFrame:
+    forecast = modelo.predict(df_nuevo[['ds']])
+    resultado = df_nuevo.merge(
+        forecast[['ds', 'yhat_lower', 'yhat_upper']], on='ds'
+    )
+    resultado['anomalia'] = (
+        (resultado['y'] < resultado['yhat_lower']) |
+        (resultado['y'] > resultado['yhat_upper'])
+    )
+    resultado['score'] = np.maximum(
+        (resultado['yhat_lower'] - resultado['y']) /
+        (resultado['yhat_upper'] - resultado['yhat_lower'] + 1e-9),
+        (resultado['y'] - resultado['yhat_upper']) /
+        (resultado['yhat_upper'] - resultado['yhat_lower'] + 1e-9)
+    ).clip(lower=0)
+    return resultado
+
 ```
 
 **Por qué Prophet y no STL para lluvia**:
+- STL con un único `period` no puede representar la estacionalidad bimodal anual
+- Prophet maneja nativamente gaps de datos (frecuentes en sensores de campo)
+- El intervalo de credibilidad es más informativo que un umbral IQR para comunicar incertidumbre a operadores
 
-- **Estacionalidad bimodal**: el régimen de lluvias en Antioquia tiene dos picos anuales (marzo–mayo, septiembre–noviembre). STL con un único `period` no puede representar esta estructura; Prophet la captura mediante series de Fourier con múltiples armónicos.
-- **Distribución asimétrica**: las series de lluvia tienen muchos ceros y cola derecha larga. El modo `multiplicative` de Prophet modela que la varianza crece con la media, lo que es apropiado para esta distribución.
-- **Datos faltantes**: Prophet interpola nativamente sobre gaps, a diferencia de STL que requiere imputación previa.
-- **Intervalo de credibilidad**: el umbral de detección no es un parámetro arbitrario sino un intervalo estadístico directamente interpretable como "rango de comportamiento esperable al 99%".
-
-**Ventajas en contexto SAMA**:
-- Captura la modulación estacional bimodal sin configuración adicional
-- Maneja gaps de comunicación sin preprocesamiento
-- `interval_width` es el único parámetro de sensibilidad a calibrar por estación
-
-**Limitaciones**:
-- Mayor costo computacional que STL — reentrenamiento mensual en lugar de semanal
-- Puede sobreajustar si la historia es corta (< 1 año) — no recomendable para estaciones nuevas hasta tener al menos dos ciclos anuales
-- Univariado, como STL
-
-**Parámetros clave**:
-
-| Parámetro | Descripción | Valor sugerido |
-|-----------|-------------|---------------|
-| `interval_width` | Amplitud del intervalo de predicción | 0.99 (conservador para alertas) |
-| `seasonality_mode` | Cómo interactúan las estacionalidades | `'multiplicative'` para lluvia |
-| `yearly_seasonality` | Armónicos anuales | `True` — captura bimodalidad |
-| `daily_seasonality` | Armónicos diarios | `True` — captura convección vespertina |
+**Reentrenamiento**: mensual con ventana deslizante de los últimos 365 días.
 
 ---
 
-### 3.2 SARIMA Residuals
+## 5. Arquitectura del Pipeline
 
-**Fundamento**: SARIMA (Seasonal AutoRegressive Integrated Moving Average) modela la serie como función de sus valores pasados y errores pasados, con componentes estacionales. Los residuos del modelo fitted representan la parte de la señal no explicada por la dinámica autoregresiva. Valores cuyo residuo supera un umbral de `k·σ` se marcan como anómalos.
+![Figura 2. Pipeline escalonado de detección de anomalías para SAMA](fig2.png)
+*Figura 2. Pipeline escalonado de detección de anomalías para SAMA. Cada capa actúa como filtro progresivo con complejidad y latencia crecientes.*
 
-La diferencia clave respecto a STL es que SARIMA captura **dependencia temporal de corto plazo**: detecta un valor anómalo no solo porque rompe el patrón estacional sino porque es inconsistente con los últimos N valores observados.
-
-**Notación**: SARIMA(p,d,q)(P,D,Q)_s
-
-- `(p,d,q)`: órdenes autoregresivo, de integración y de media móvil no-estacionales
-- `(P,D,Q)_s`: ídem estacionales con período `s`
-
-**Selección automática de orden** con `pmdarima.auto_arima` — se ejecuta una vez durante el setup por estación, no en cada inferencia.
-
-**Ventajas en contexto SAMA**:
-- Captura anomalías dinámicas: un nivel que sube cuando llevaba 3 horas bajando
-- Ampliamente aceptado en hidrología operacional, fácil de justificar metodológicamente
-- Produce intervalos de predicción que dan una medida natural de "cuánto de anómalo" es un valor
-
-**Limitaciones**:
-- Univariado
-- Asume estacionariedad después de diferenciación — puede requerir transformación logarítmica para series de lluvia
-- Sensible a gaps de datos; requiere interpolación previa o modelos con manejo de datos faltantes
-
-**Relación con Capa 1**: los métodos son complementarios, no redundantes. STL/Prophet detectan anomalías respecto al patrón estacional esperado; SARIMA detecta anomalías respecto a la dinámica reciente. Un punto puede pasar la Capa 1 y fallar SARIMA (ej. un valor dentro del rango estacional pero inconsistente con los últimos 6 valores observados).
-
----
-
-### 3.3 Isolation Forest (multivariado)
-
-**Fundamento**: Isolation Forest (Liu et al., 2008) construye un ensemble de árboles de decisión aleatorios. La intuición es que los puntos anómalos son más fáciles de "aislar" (requieren menos particiones para separarse del resto). El score de anomalía es la profundidad promedio de aislamiento normalizada.
-
-En el contexto de SAMA, la innovación está en el **feature engineering multivariado**: en lugar de operar sobre el valor crudo, se construyen features que capturan el contexto temporal y las relaciones entre sensores.
-
-**Features propuestas**:
+El pipeline implementa un principio de **complejidad incremental activa**: en producción corren simultáneamente todos los modelos disponibles en la etapa actual. Las salidas de cada modelo se agregan en un score final ponderado, no en una lógica de fail-fast pura. Esto permite que modelos simples y complejos se complementen y que el operador vea qué modelos flaggearon el punto.
 
 ```
-Para cada variable v en {nivel, lluvia, temperatura}:
-  - v_t              : valor actual
-  - Δv_t             : primera diferencia (velocidad de cambio)
-  - μ(v, w)          : media móvil en ventana w
-  - σ(v, w)          : desviación estándar móvil en ventana w
-
-Features cruzadas (nivel × lluvia):
-  - lluvia_acum_6h   : lluvia acumulada en las últimas 6 horas (proxy de input de cuenca)
-  - ratio_nivel_lluvia: nivel_delta / (lluvia_acum_6h + ε)  — detecta nivel sin lluvia
-  - hora_del_dia     : codificación cíclica (sin, cos)
-  - mes              : codificación cíclica (sin, cos)
-```
-
-**Ventajas en contexto SAMA**:
-- No supervisado — no requiere etiquetas
-- Captura anomalías contextuales multivariadas indetectables con métodos univariados
-- Robusto ante alta dimensionalidad
-- Score continuo (no solo binario) permite priorizar alertas
-
-**Limitaciones**:
-- La calidad del resultado depende fuertemente del feature engineering
-- No es online — corre en batch diario sobre la ventana reciente
-- El parámetro `contamination` (proporción esperada de anomalías) requiere calibración por estación y por variable
-
----
-
-## 4. Arquitectura del Pipeline en Capas
-
-![Figura 2. Pipeline escalonado de detección de anomalías para SAMA](figs/fig2.png)
-*Figura 2. Pipeline escalonado de detección de anomalías para SAMA. Cada capa actúa como filtro progresivo: las capas tempranas detectan errores evidentes de sensor; las capas avanzadas capturan patrones sutiles y contextuales.*
-
-El pipeline implementa un principio de **fail-fast escalonado**: cada capa filtra lo que la anterior no puede, con latencia y costo computacional crecientes. Si una capa detecta una anomalía, se emite la alerta sin invocar las capas siguientes.
-
-```
-Dato entrante (sensor nivel / pluviómetro)
+Dato entrante (serie univariada por sensor)
         │
         ▼
-┌─────────────────────────────────────┐
-│  CAPA 0 — Reglas físicas            │  Latencia: < 1 ms
-│  Umbrales de dominio hardcoded      │  Costo: mínimo
-│  Valor negativo, rango imposible,   │  Interpretabilidad: total
-│  sensor atascado (N consecutivos)   │
-└─────────────┬───────────────────────┘
-              │ pasa
-              ▼
-┌─────────────────────────────────────┐
-│  CAPA 1 — STL + IQR                 │  Latencia: segundos
-│  Detección por residual estacional  │  Costo: bajo
-│  Univariado, por estación           │  Interpretabilidad: alta
-└─────────────┬───────────────────────┘
-              │ pasa
-              ▼
-┌─────────────────────────────────────┐
-│  CAPA 2 — SARIMA residuals          │  Latencia: segundos
-│  Detección por dinámica autoregres. │  Costo: medio
-│  Univariado, por estación           │  Interpretabilidad: alta
-└─────────────┬───────────────────────┘
-              │ pasa
-              ▼
-┌─────────────────────────────────────┐
-│  CAPA 3 — Isolation Forest          │  Latencia: minutos (batch)
-│  Detección multivariada             │  Costo: medio
-│  Cruza nivel + lluvia + contexto    │  Interpretabilidad: media
-└─────────────┬───────────────────────┘
+┌─────────────────────────────────────────┐
+│  VALIDACIÓN PREVIA (heredada de QA)     │
+│  Rango físico, gaps, ceros inválidos    │
+└─────────────┬───────────────────────────┘
               │
               ▼
-     Alerta con metadatos:
-     {capa, tipo, score, variables_involucradas}
+┌─────────────────────────────────────────┐
+│  CAPA 1 — Cuantiles históricos          │  Siempre activa
+│  + detector de valor constante          │  Score: s1
+└─────────────┬───────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────┐
+│  CAPA 2 — STL+IQR (nivel)              │  Activa desde Etapa 2
+│           SARIMA residuals (ambas)      │  Score: s2
+└─────────────┬───────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────┐
+│  CAPA 3 — Prophet + IC (lluvia)         │  Activa desde Etapa 3
+│           (≥ 18 meses de historia)      │  Score: s3
+└─────────────┬───────────────────────────┘
+              │
+              ▼
+     Score agregado: S = w1·s1 + w2·s2 + w3·s3
+     Alerta si S ≥ umbral adaptativo
 ```
 
-Cada alerta emitida incluye: timestamp, estación, capa que la detectó, tipo de anomalía, score de confianza y — para Capa 3 — las features con mayor contribución al score (SHAP values).
+El **score agregado ponderado** permite graduar la alerta (warning vs. crítica) y registrar cuánto contribuyó cada modelo — información valiosa para el operador y para el loop de feedback.
+
+Los pesos `w1, w2, w3` se calibran empíricamente durante la validación operacional. Un punto de partida razonable: `w1=0.2, w2=0.5, w3=0.3` (STL+SARIMA dominan cuando están disponibles).
 
 ---
 
-## 5. Estrategia de Reentrenamiento
+## 6. Gestión del Entrenamiento Inicial
 
-Esta es una de las decisiones más críticas del sistema y frecuentemente subestimada.
+### 6.1 Preparación del histórico base
 
-### 5.1 ¿Por qué reentrenar?
+El histórico inicial, aunque ya tiene calidad de rango aplicada, requiere pasos adicionales antes de usarse para entrenar:
 
-Los modelos se degradan por **data drift**: el comportamiento del sensor y del fenómeno cambia en el tiempo por:
+1. **Detección de gaps**: identificar períodos sin datos. Los gaps > 2 horas deben marcarse explícitamente, no imputarse con la media — especialmente si coinciden con eventos de lluvia intensa (los sensores fallan precisamente durante eventos extremos).
 
-- Cambios estacionales (régimen de lluvias bimodal en Antioquia)
-- Degradación física del sensor (deriva lenta)
-- Cambios en la cuenca (deforestación, obras, eventos geomorfológicos)
-- Reemplazo o recalibración del sensor (ruptura estructural en la serie)
+2. **Limpieza de cuantiles extremos**: aunque el rango físico fue verificado, pueden existir valores en los percentiles 0.1% y 99.9% que son técnicamente válidos pero distorsionan los modelos. Se recomienda aplicar winsorización leve antes del entrenamiento (no del almacenamiento).
 
-Un modelo entrenado en época seca aplicado en temporada de lluvias generará exceso de falsos positivos. Un modelo que no conoce la deriva progresiva de un sensor la marcará indefinidamente como anomalía en lugar de actualizar su baseline.
+3. **Segmentación por sensor**: cada sensor entrena su propio modelo independiente. No hay matriz multivariada en esta etapa.
 
-### 5.2 Frecuencias de reentrenamiento por capa
+4. **Inspección visual obligatoria**: antes de entrenar el primer modelo sobre un sensor, un analista debe revisar la serie completa. Dada la ausencia de etiquetas, esta inspección inicial es el único mecanismo de validación de ground truth disponible.
 
-| Capa | Método | Variable | Frecuencia | Trigger adicional |
-|------|--------|----------|------------|-------------------|
-| Capa 1 | STL + IQR | Nivel | Semanal (rolling 60 días) | Cambio de temporada |
-| Capa 1 | Prophet + IC | Lluvia | Mensual (rolling 365 días) | Inicio de temporada de lluvias |
-| Capa 2 | SARIMA | Nivel y lluvia | Mensual (rolling 90 días) | CUSUM sobre MAPE supera 2× baseline |
-| Capa 3 | Isolation Forest | Multivariado | Mensual (rolling 90 días) | PSI > 0.2 en features de entrada |
+### 6.2 Arranque sin etiquetas: estrategia de validación
 
-**Razonamiento**:
+La ausencia de etiquetas impide calcular métricas supervisadas (precision, recall, F1). La estrategia de validación en esta etapa es:
 
-- **STL+IQR (nivel, semanal)**: liviano y se beneficia de actualización frecuente para seguir cambios graduales en el comportamiento del sensor y la dinámica fluvial.
-- **Prophet (lluvia, mensual)**: requiere suficiente historia anual para estimar bien la estacionalidad bimodal; ventana mínima de 365 días. Reentrenamiento mensual con ventana larga estabiliza los armónicos de Fourier.
-- **SARIMA (mensual)**: el costo de selección de orden con `auto_arima` hace prohibitivo el reentrenamiento semanal; la ventana de 90 días captura bien la dinámica reciente sin perder contexto estacional.
-- **Isolation Forest (mensual)**: requiere suficiente data representativa de condiciones normales; ventanas cortas producen modelos inestables en el espacio de features multivariadas.
+**Validación visual**: el analista revisa una muestra de los puntos flaggeados por cada modelo y los clasifica como verdadero positivo o falso positivo. Esta clasificación retroalimenta el ajuste de umbrales y, progresivamente, construye el primer conjunto de datos etiquetado.
 
-### 5.3 Triggers basados en métricas (reentrenamiento reactivo)
+**Métricas operacionales proxy**:
+- *Tasa de alertas por sensor por semana*: un modelo bien calibrado debería generar entre 0.5% y 3% de alertas sobre el total de datos. Tasas superiores indican umbral demasiado sensible; inferiores, modelo insuficientemente sensible.
+- *Distribución temporal de alertas*: las alertas deberían correlacionar con períodos de lluvia intensa o eventos conocidos, no distribuirse aleatoriamente.
+- *Concordancia entre modelos*: si Cuantiles y SARIMA coinciden en flaggear un punto, la probabilidad de que sea anomalía real es mayor que si solo uno de ellos lo detecta.
 
-Además del reentrenamiento programado, el sistema debe disparar reentrenamiento cuando se detecte degradación del modelo:
+**Protocolo de feedback humano** (desde el primer día):
 
-**Population Stability Index (PSI)** sobre las features de entrada:
 ```
-PSI = Σ (p_actual - p_ref) · ln(p_actual / p_ref)
-
-PSI < 0.1  : sin cambio significativo
-0.1–0.2    : cambio moderado — monitorear
-PSI > 0.2  : cambio mayor — reentrenar
+Punto flaggeado
+      │
+      ▼
+Cola de revisión (operador)
+      │
+      ├──► Confirma anomalía → excluir de entrenamiento futuro
+      │                        + agregar a dataset etiquetado
+      │
+      └──► Falso positivo  → registrar + ajustar umbral del modelo
+                             que generó el falso positivo
 ```
 
-**MAPE sobre predicciones SARIMA** en ventana reciente:
-```
-Si MAPE(últimas 168h) > 2 × MAPE(baseline) → reentrenar SARIMA
-```
-
-**Tasa de alertas** (proxy de modelo degradado):
-```
-Si tasa_alertas_7d > 3 × tasa_alertas_baseline → revisar umbral o reentrenar
-```
+Este loop es el mecanismo principal de mejora continua y la única forma de construir etiquetas en ausencia de un dataset anotado previo.
 
 ---
 
-## 6. Infraestructura MLOps
+## 7. Pipeline de Reentrenamiento (MLOps)
 
-### 6.1 Componentes del sistema
+### 7.1 Frecuencias por modelo
 
+| Modelo | Variable | Frecuencia | Ventana de entrenamiento | Datos mínimos requeridos |
+|--------|----------|------------|--------------------------|--------------------------|
+| Cuantiles | Nivel y lluvia | Mensual | Toda la historia disponible | 7 días |
+| STL + IQR | Nivel | Semanal | Últimos 60 días | 60 días |
+| SARIMA | Nivel y lluvia | Mensual | Últimos 90 días | 90 días |
+| Prophet | Lluvia | Mensual | Últimos 365 días | 730 días (2 años) |
+
+**Razonamiento de las ventanas**:
+- Los cuantiles se benefician de toda la historia disponible (más datos = mejor estimación de percentiles extremos).
+- STL necesita historia suficiente para estimar la estacionalidad diaria, pero no más de 60 días — historia muy larga introduce no-estacionariedad.
+- SARIMA con 90 días captura bien la dinámica estacional diaria sin perder sensibilidad a cambios recientes.
+- Prophet necesita múltiples ciclos anuales; no se activa hasta tener 2 años.
+
+### 7.2 Triggers de reentrenamiento reactivo
+
+Además del calendario, el sistema debe reentrenar cuando detecte degradación del modelo:
+
+**Deriva en tasa de alertas (proxy de model drift)**:
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     INFRAESTRUCTURA MLOPS                   │
-│                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │  Ingesta de  │    │  Feature     │    │  Model       │  │
-│  │  datos       │───▶│  Store       │───▶│  Registry    │  │
-│  │  (SAMA API)  │    │  (features   │    │  (versiones  │  │
-│  │              │    │  calculadas) │    │  de modelos) │  │
-│  └──────────────┘    └──────────────┘    └──────┬───────┘  │
-│                                                 │           │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────▼───────┐  │
-│  │  Alertas +   │◀───│  Inference   │◀───│  Scheduler   │  │
-│  │  Dashboard   │    │  Service     │    │  (retrain    │  │
-│  │              │    │              │    │  triggers)   │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘  │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  Monitoring: PSI, MAPE drift, alert rate, data gaps  │  │
-│  └──────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+Si tasa_alertas_últimas_2_semanas > 3 × tasa_alertas_baseline:
+    → umbral probablemente desactualizado → reentrenar
 ```
 
-### 6.2 Stack tecnológico recomendado
+**Cambio estructural en la serie (CUSUM sobre media rolling)**:
+```python
+def detectar_cambio_estructural(serie: pd.Series,
+                                 ventana: int = 96*7,   # 1 semana a 15-min
+                                 umbral_delta: float = 0.3) -> bool:
+    """Compara la media de la última semana con la semana anterior."""
+    if len(serie) < 2 * ventana:
+        return False
+    media_reciente = serie.iloc[-ventana:].mean()
+    media_anterior = serie.iloc[-2*ventana:-ventana].mean()
+    rango = serie.quantile(0.95) - serie.quantile(0.05) + 1e-9
+    return abs(media_reciente - media_anterior) / rango > umbral_delta
+```
 
-| Componente | Herramienta | Justificación |
-|------------|-------------|---------------|
-| Orquestación de pipelines | **Apache Airflow** o **Prefect** | DAGs para reentrenamiento programado y reactivo |
-| Registro de experimentos | **MLflow** | Tracking de parámetros, métricas y artefactos por modelo/estación |
-| Feature store | **Hopsworks** (open source) o tablas en PostgreSQL + TimescaleDB | Features calculadas reutilizables entre capas |
-| Servicio de inferencia | **FastAPI** + worker async | Liviano, adecuado para on-premise o cloud bajo |
-| Monitoreo de modelos | **Evidently AI** | Detección de data drift y model drift con reportes automáticos |
-| Versionado de datos | **DVC** | Reproducibilidad de entrenamientos por estación |
-| Almacenamiento de modelos | **MLflow Model Registry** | Stages: Staging → Production → Archived |
+**Reemplazo o recalibración de sensor**: este evento debe registrarse en el sistema de gestión de activos y disparar automáticamente el reentrenamiento de todos los modelos de ese sensor, reseteando la ventana de entrenamiento desde la fecha del cambio.
 
-### 6.3 DAG de reentrenamiento (Airflow/Prefect)
+### 7.3 Stack MLOps recomendado
+
+| Componente | Herramienta | Rol |
+|------------|-------------|-----|
+| Orquestación | **Prefect** (más simple que Airflow) | DAGs de reentrenamiento programado y reactivo |
+| Registro de modelos | **MLflow** | Versionar modelos por sensor, tracking de parámetros y métricas |
+| Monitoreo de drift | **Evidently AI** | Reportes automáticos de drift en distribución de entrada |
+| Almacenamiento de series | **TimescaleDB** (PostgreSQL + extensión) | Eficiente para series de tiempo a alta frecuencia |
+| Servicio de inferencia | **FastAPI** + worker async | Liviano, adecuado para on-premise |
+| Versionado de datos | **DVC** | Reproducibilidad de entrenamientos por sensor |
+
+### 7.4 DAG de reentrenamiento (Prefect)
 
 ```python
-# Pseudocódigo del DAG de reentrenamiento semanal
+from prefect import flow, task
+import mlflow
 
-@dag(schedule="0 2 * * 1")  # Lunes 2am
-def retrain_pipeline_sama():
+@task
+def verificar_datos_suficientes(sensor_id: str, modelo: str,
+                                  min_dias: int) -> bool:
+    n_dias = contar_dias_historia_limpia(sensor_id)
+    return n_dias >= min_dias
 
-    @task
-    def verificar_drift(estacion_id, modelo):
-        """Calcula PSI y MAPE reciente. Retorna True si hay que reentrenar."""
-        psi = calcular_psi(features_recientes, features_referencia)
-        mape_reciente = calcular_mape_reciente(modelo, estacion_id)
-        return psi > 0.2 or mape_reciente > 2 * modelo.mape_baseline
+@task
+def reentrenar_modelo(sensor_id: str, modelo_tipo: str,
+                      ventana_dias: int) -> dict:
+    datos = cargar_datos_limpios(sensor_id, dias=ventana_dias)
+    # excluir puntos confirmados como anómalos por operadores
+    datos = excluir_anotados_anomalos(datos, sensor_id)
+    nuevo_modelo = entrenar(modelo_tipo, datos)
+    metricas = calcular_metricas_operacionales(nuevo_modelo, datos)
+    return {"modelo": nuevo_modelo, "metricas": metricas}
 
-    @task
-    def reentrenar(estacion_id, modelo_tipo, ventana_dias=90):
-        """Reentrena el modelo con la ventana más reciente de datos limpios."""
-        data = cargar_datos_limpios(estacion_id, dias=ventana_dias)
-        nuevo_modelo = entrenar(modelo_tipo, data)
-        metricas = evaluar(nuevo_modelo, data_validacion)
-        return nuevo_modelo, metricas
+@task
+def promover_modelo(sensor_id: str, nuevo_modelo: dict,
+                    modelo_tipo: str) -> None:
+    with mlflow.start_run():
+        mlflow.log_params(nuevo_modelo["modelo"].get_params())
+        mlflow.log_metrics(nuevo_modelo["metricas"])
+        mlflow.sklearn.log_model(nuevo_modelo["modelo"],
+                                  f"{sensor_id}_{modelo_tipo}")
 
-    @task
-    def promover_si_mejora(nuevo_modelo, metricas, modelo_produccion):
-        """Solo promueve a producción si el nuevo modelo es mejor."""
-        if metricas["f1"] >= modelo_produccion.metricas["f1"] * 0.98:
-            mlflow.register_model(nuevo_modelo, stage="Production")
-        else:
-            mlflow.register_model(nuevo_modelo, stage="Staging")
-            alertar_equipo("Modelo nuevo no supera producción — revisión manual")
+@flow(name="reentrenamiento-semanal-sama")
+def pipeline_reentrenamiento_semanal():
+    sensores = obtener_lista_sensores_activos()
+    for sensor_id in sensores:
+        # STL+IQR — semanal para sensores de nivel
+        if es_sensor_nivel(sensor_id):
+            if verificar_datos_suficientes(sensor_id, "stl_iqr", 60):
+                modelo = reentrenar_modelo(sensor_id, "stl_iqr", 60)
+                promover_modelo(sensor_id, modelo, "stl_iqr")
 ```
 
-### 6.4 Gestión de datos de entrenamiento
-
-Un aspecto frecuentemente ignorado: **los datos usados para reentrenar deben ser datos limpios** (sin anomalías confirmadas). De lo contrario, el modelo aprende que las anomalías son normales.
-
-Protocolo propuesto:
-
-1. Los datos marcados como anomalía por cualquier capa van a una **cola de revisión**.
-2. Un operador confirma o descarta la anomalía (interfaz simple: confirmar / falso positivo).
-3. Los datos confirmados como anómalos se **excluyen** del conjunto de entrenamiento.
-4. Los datos confirmados como falsos positivos retroalimentan el ajuste de umbrales.
-
-Este loop de feedback humano es el mecanismo de mejora continua del sistema.
-
 ---
 
-## 7. Métricas de Evaluación
+## 8. Hoja de Ruta por Etapas
 
-Dado que las etiquetas son escasas, se propone una evaluación mixta:
+| Etapa | Tiempo | Historia disponible | Modelos activos | Hito de validación |
+|-------|--------|--------------------|-----------------|--------------------|
+| **E1 — Arranque** | Meses 1–3 | < 3 meses | Cuantiles + detector constante | Tasa de alertas < 3%, inspección visual de muestra aleatoria |
+| **E2 — Consolidación** | Meses 3–9 | 3–9 meses | + STL+IQR (nivel), + SARIMA | Concordancia entre modelos > 60% en alertas, primeras 50 etiquetas manuales |
+| **E3 — Madurez** | Mes 18+ | > 18 meses | + Prophet (lluvia) | Evaluación supervisada con dataset etiquetado acumulado, F1 > 0.75 |
 
-### 7.1 Métricas supervisadas (sobre eventos etiquetados disponibles)
+### Fase 0 — EDA y setup (previo a E1)
 
-| Métrica | Descripción | Prioridad en SAMA |
-|---------|-------------|-------------------|
-| **Recall** | Fracción de anomalías reales detectadas | **Máxima** — miss de avenida torrencial es inaceptable |
-| **Precision** | Fracción de alertas que son reales | Alta — falsas alarmas erosionan confianza comunitaria |
-| **F1-score** | Media armónica precision/recall | Referencia general |
-| **Tiempo de detección** | Latencia desde inicio de anomalía hasta alerta | Crítico para alertas tempranas |
+Antes de entrenar cualquier modelo, se requiere:
 
-### 7.2 Métricas no supervisadas (operacionales)
-
-- **Tasa de alertas por estación y temporada**: detecta modelos demasiado sensibles o insensibles
-- **Distribución de capas que detectan**: si Capa 3 detecta el 90% de las anomalías, Capas 1-2 están mal calibradas
-- **PSI mensual por feature y por estación**: monitoreo de drift en producción
-
----
-
-## 8. Cronograma de Implementación
-
-| Fase | Duración | Actividades | Entregable |
-|------|----------|-------------|------------|
-| **F1 — EDA y baseline** | 3 semanas | Análisis exploratorio de series SAMA, identificación de periodicidades, distribución de gaps, construcción del dataset de evaluación con eventos etiquetados históricos | Notebook EDA + dataset de evaluación |
-| **F2 — Capas 0 y 1** | 2 semanas | Implementación de reglas físicas + STL+IQR, calibración de umbrales por estación, validación visual con operadores | Módulo `capa0_capa1.py` + resultados de calibración |
-| **F3 — Capa 2** | 2 semanas | Selección automática de orden SARIMA por estación (`auto_arima`), evaluación comparativa contra STL+IQR | Módulo `capa2_sarima.py` + reporte comparativo |
-| **F4 — Capa 3** | 3 semanas | Feature engineering multivariado, entrenamiento Isolation Forest, análisis SHAP de contribución de features | Módulo `capa3_iforest.py` + análisis de features |
-| **F5 — Integración y MLOps** | 3 semanas | Pipeline unificado, DAGs de reentrenamiento en Airflow, Model Registry en MLflow, monitoreo con Evidently | Pipeline en producción + documentación de operación |
-| **F6 — Validación operacional** | 2 semanas | Período de operación paralela (sistema automático + revisión manual), ajuste fino de umbrales, protocolo de feedback humano | Informe de validación + parámetros finales |
-
-**Total estimado**: 15 semanas
+1. **EDA por sensor**: distribución de valores, histograma, serie temporal completa, identificación de gaps, frecuencia real de muestreo (puede diferir de la nominal).
+2. **Caracterización de estacionalidad**: periodograma o autocorrelación para confirmar que existe ciclo diario capturado en los datos disponibles.
+3. **Selección de `period`**: para datos a 15-min, `period=96`. Para datos a 5-min, `period=288`. Verificar empíricamente con ACF.
+4. **Inspección visual de al menos 4 semanas** por sensor con un analista hidrológico — esta inspección genera las primeras anotaciones informales que orientan la calibración de umbrales.
 
 ---
 
 ## 9. Consideraciones Específicas para Cuencas Andinas
 
-Los métodos descritos asumen implícitamente ciertas propiedades de las series que deben verificarse para el contexto de Antioquia:
+**Ciclo convectivo vespertino**: en muchas cuencas de Antioquia, la lluvia ocurre preferentemente en las tardes (convección orográfica). Esto genera un ciclo diario fuerte en los pluviómetros que STL y SARIMA capturan, pero que puede confundirse con anomalías si los modelos se inicializan con poca historia.
 
-**Estacionalidad bimodal**: el régimen de lluvias en Antioquia tiene dos temporadas de lluvias (marzo–mayo, septiembre–noviembre). Esta es la razón principal para usar Prophet en pluviómetros en lugar de STL: los armónicos de Fourier de Prophet representan nativamente esta estructura sin configuración adicional. Para sensores de nivel, el ciclo diario dominante es suficientemente estable para que STL sea adecuado.
+**Respuesta hiperrápida**: cuencas de montaña con pendientes pronunciadas tienen tiempos de concentración de minutos a pocas horas. A 15-min de resolución, un evento real puede verse como un spike puntual si el tiempo de concentración es menor que el intervalo de muestreo. Estos casos son difíciles de distinguir de fallas de sensor sin contexto adicional.
 
-**Respuesta hiperrápida**: cuencas de montaña con alta pendiente generan crecidas súbitas con tiempos de concentración de minutos a pocas horas. La resolución temporal del sensor (típicamente 15 min en SAMA) debe alinearse con el `period` usado en los modelos.
+**Gaps correlacionados con eventos extremos**: los sensores tienden a fallar durante eventos de alta lluvia (inundación del equipo, pérdida de comunicación satelital). Imputar estos gaps con valores promedio es incorrecto y contamina el histórico de entrenamiento. Los gaps > 2 horas durante períodos de lluvia detectada en estaciones vecinas deben marcarse como "gap durante evento potencial" y excluirse del entrenamiento.
 
-**Distribución no-gaussiana**: las series de lluvia tienen distribución fuertemente asimétrica (muchos ceros, cola derecha larga). El IQR es más robusto que z-score en este caso, pero para SARIMA puede ser necesaria transformación logarítmica o Box-Cox.
-
-**Datos faltantes correlacionados con eventos extremos**: los sensores tienden a fallar precisamente durante eventos de alta lluvia (inundación del equipo, pérdida de comunicación). Imputar estos gaps con la media histórica es incorrecto — se recomienda marcarlos explícitamente como "gap durante evento potencial" y no usarlos para reentrenamiento.
+**Distribución no-gaussiana de lluvia**: las series de lluvia tienen distribución fuertemente asimétrica con exceso de ceros. Para SARIMA, se recomienda transformación log(x + 0.1) antes del ajuste. Para cuantiles, el percentil 0% es cero la mayor parte del tiempo — usar los percentiles condicionados a lluvia > 0 para el umbral superior, y tratar la ocurrencia (lluvia vs. no-lluvia) como variable binaria separada.
 
 ---
 
@@ -451,7 +479,7 @@ Los métodos descritos asumen implícitamente ciertas propiedades de las series 
 - Leigh et al. (2019). A framework for automated anomaly detection in high-frequency water-quality data from in situ sensors. *Journal of Hydrology*, 586, 124797.
 - Liu et al. (2008). Isolation Forest. *IEEE International Conference on Data Mining*.
 - Rebolho et al. (2021). Anomaly detection in streamflow time series — inter-evaluator agreement study, 674 series. *ResearchGate*.
-- Taylor, S. J. & Letham, B. (2018). Forecasting at scale. *The American Statistician*, 72(1), 37–45. (Prophet)
+- Taylor, S. J. & Letham, B. (2018). Forecasting at scale. *The American Statistician*, 72(1), 37–45.
 - Ye et al. (2025). A Survey of Deep Anomaly Detection in Multivariate Time Series. *Sensors*, 25(1), 190.
 
 ---
