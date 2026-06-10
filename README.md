@@ -3,7 +3,6 @@
 
 **Versión**: 2.0  
 **Fecha**: Junio 2026  
-**Audiencia**: Ingenieros e investigadores DAGRAN / Universidad de Antioquia
 
 ---
 
