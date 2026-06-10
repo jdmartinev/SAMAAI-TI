@@ -26,7 +26,7 @@ Este contexto impone restricciones concretas que definen toda la estrategia meto
 
 Dado que los datos ya tienen calidad de rango aplicada, las anomalías que el pipeline debe detectar son las que ese proceso no captura:
 
-![Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico (SAMA)](fig1.png)
+![Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico (SAMA)](figs/fig1.png)
 *Figura 1. Taxonomía de anomalías en sistemas de monitoreo hidrológico. Se distinguen fallas instrumentales (A), anomalías contextuales e hidrológicas (B) y su impacto operacional (C).*
 
 | Tipo | Descripción | ¿Detectable con rangos? | Prioridad |
@@ -591,7 +591,7 @@ def detectar_prophet(modelo: Prophet, df_nuevo: pd.DataFrame) -> pd.DataFrame:
 
 ## 5. Arquitectura del Pipeline
 
-![Figura 2. Pipeline escalonado de detección de anomalías para SAMA](fig2.png)
+![Figura 2. Pipeline escalonado de detección de anomalías para SAMA](figs/fig2.png)
 *Figura 2. Pipeline escalonado de detección de anomalías para SAMA. Cada capa actúa como filtro progresivo con complejidad y latencia crecientes.*
 
 El pipeline implementa un principio de **complejidad incremental activa**: en producción corren simultáneamente todos los modelos disponibles en la etapa actual. Las salidas de cada modelo se agregan en un score final ponderado, no en una lógica de fail-fast pura. Esto permite que modelos simples y complejos se complementen y que el operador vea qué modelos flaggearon el punto.
